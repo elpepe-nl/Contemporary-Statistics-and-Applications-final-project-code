@@ -1,0 +1,476 @@
+########Data########
+library(dplyr)
+library(tidyr)
+library(MASS)
+library(janitor)
+library(class)
+library(mclust)
+library(caret)
+
+height_clean <- gsub("''", "\"", nflcomb$Height)
+height_clean <- gsub("\"", "", height_clean)  # remove inch marks
+height_clean <- gsub("[^0-9']", "", height_clean)
+feet <- as.numeric(sub("'(.*)", "", height_clean))
+inches <- as.numeric(sub(".*'", "", height_clean))
+inches[is.na(inches)] <- 0
+nflcomb$height_in <- feet * 12 + inches
+nflcomb$height_cm <- nflcomb$height_in * 2.54
+
+nflcomb_clean <- janitor::clean_names(nflcomb)
+nflcomb_clean <- nflcomb_clean %>% mutate(weight_kg = weight * 0.45359237)
+combine_cols <- c("x40yd", "vertical", "bench", "broad_jump", "x3cone", "shuttle")
+nflcomb_clean <- nflcomb_clean %>%
+  mutate(
+    missing_drills = rowSums(is.na(dplyr::select(., all_of(combine_cols))))
+  )
+
+filtered_df <- nflcomb_clean %>%  filter(missing_drills < 1)
+filtered_df[c(1:2, 5:8, 16:19, 24)] <- NULL
+filtered_df[c(1,10,12, 13)] <- NULL
+final_df <- filtered_df #9 columns (1st one classes, rest covariates, so p=8)
+
+
+final_df[,"position_group"] <- factor(final_df[,"position_group"])
+final_df <- final_df %>% filter_out(position_group == "QB")
+final_df <- final_df %>% filter_out(position_group == "ST")
+
+
+y <- as.matrix(final_df[,1])
+y <- factor(y)
+yn <- as.numeric(y)
+X <- as.matrix(final_df[,2:9], ncol = 8)
+Xs <- scale(X)
+final_df_s <- as.data.frame(cbind(final_df[,1], Xs))
+#############################################
+###Plot 1
+############################################
+Y <- factor(as.matrix(filtered_df[,"position_group"])) 
+levels_Y <- levels(Y) ##"CB" "DL" "FB" "LB" "OL" "QB" "RB" "S"  "ST" "TE" "WR"
+count_mat <- matrix(0, ncol = length(levels_Y))
+for (i  in 1:11){
+  vec <- which(Y == levels_Y[i])
+  count_mat[i] <- length(vec)
+}
+colnames(count_mat) <- levels_Y
+count_mat <- data.frame(count_mat)
+
+my_bar <- barplot(as.vector(as.matrix(count_mat[1,])), border=F, names.arg=colnames(count_mat), 
+                  las=2, 
+                  col= c("red", "red","blue","red","blue","blue","blue","red","green","blue","blue") , 
+                  ylim=c(0, 450), 
+                  xlab = "Position groups",
+                  main="" )
+text(my_bar, count_mat+10, paste("n: ", count_mat, sep="") ,cex=0.8)
+########################################
+####Regular kNN k selection 
+########################################
+sokolova_measures <- function(cm) {
+  N  <- sum(cm)
+  tp <- diag(cm)
+  fp <- colSums(cm) - tp
+  fn <- rowSums(cm) - tp 
+  tn <- N - tp - fp - fn
+
+  safe <- function(a, b){ifelse(b == 0, 0, a / b)} 
+  F1s <- function(P, R){safe(2 * P * R , P + R)}
+
+  P_mu <- sum(tp) / sum(tp + fp)
+  R_mu <- sum(tp) / sum(tp + fn)
+  P_M  <- mean(tp / (tp + fp), na.rm = TRUE)
+  R_M  <- mean(tp / (tp + fn), na.rm = TRUE)
+
+  c("Avg Accuracy" = mean((tp + tn) / N),
+    "Error Rate"   = mean((fp + fn) / N),
+    "Micro-avg precision"= P_mu, "Micro-avg recall" = R_mu, "Micro-avg F1-score" = F1s(P_mu, R_mu),
+    "Macro-avg precision"  = P_M,  "Macro-avg recall" = R_M,  "Macro-avg F1-score"  = F1s(P_M, R_M))
+}
+
+
+k_grid = c(1, 3, 5, 9, 15, 25, 50, 100, 200)
+
+knn_check_mat <- matrix(0, nrow = nrow(Xs), ncol = length(k_grid))
+performance_measure_mat <- matrix(0, nrow = 8, ncol = length(k_grid), dimnames = list(c("Avg Accuracy", "Error rate",
+     "Micro-avg precision", "Micro-avg recall", "Micro-avg F1-score", "Macro-avg precision", "Macro-avg recall", "Macro-avg F1-score"), k_grid))
+
+for (i in 1:length(k_grid)){
+  knn_check_mat[,i] = knn.cv(Xs, cl = yn, k = k_grid[i])
+  cm <- table(truth = yn, pred = knn_check_mat[,i])
+
+  performance_measure_mat[,i] <- as.matrix(sokolova_measures(cm))
+}
+
+max.col(performance_measure_mat) #yields maximum values for k = 5 except for error rate
+max.col(-performance_measure_mat) #leads to 5 being the k that yields minimal error
+###############################################
+##Priors performance comparison (LDA, QDA, GMM)
+##############################################
+N <- nrow(Xs)
+K <- length(unique(y))
+un_prior <- c(rep(1/K, K))
+levels_y = levels(y)
+count_mat_1 <- matrix(0, ncol = K)
+for (i  in 1:K){
+  vec <- which(y == levels_y[i])
+  count_mat_1[i] <- length(vec)
+} 
+in_prior <- count_mat_1/(N-1)
+
+
+LDA_outcome_in <- lda(x = Xs, grouping = y, ,CV = TRUE)
+QDA_outcome_in <- qda(x = Xs, grouping = y, CV = TRUE)
+LDA_outcome_un <- lda(x = Xs, grouping = y, prior = un_prior, CV = TRUE)
+QDA_outcome_un <- qda(x = Xs, grouping = y, prior = un_prior, CV = TRUE)
+GMM_obj <-  MclustDA(Xs, y)
+GMM_outcome_in <- cvMclustDA(GMM_obj, nfold = length(y), prop = in_prior)
+GMM_outcome_un <-  cvMclustDA(GMM_obj, nfold = length(y), prop = un_prior)
+
+column_names <- c("LDA w/ inf. prior", "LDA w/ uninf. prior", "QDA w/ inf. prior", "QDA w/ uninf. prior", "GMM w/ inf. prior", "GMM w/ uninf. prior")
+performance_measure_mat_2 <- matrix(0, nrow = 8, ncol = 6, dimnames = list(c("Avg Accuracy", "Error rate",
+     "Micro-avg precision", "Micro-avg recall", "Micro-avg F1-score", "Macro-avg precision", "Macro-avg recall", "Macro-avg F1-score"), column_names))
+
+for (i in 1:6){
+  if (i == 1){cm =  table(truth = yn, pred = LDA_outcome_in$class)}
+  if (i == 2){cm =  table(truth = yn, pred = LDA_outcome_un$class)}
+  if (i == 3){cm =  table(truth = yn, pred = QDA_outcome_in$class)}
+  if (i == 4){cm =  table(truth = yn, pred = QDA_outcome_un$class)}
+  if (i == 5){cm =  table(truth = yn, pred = GMM_outcome_in$classification)}
+  if (i == 6){cm =  table(truth = yn, pred = GMM_outcome_un$classification)}
+
+  performance_measure_mat_2[,i] <- as.matrix(sokolova_measures(cm))
+} 
+
+max.col(performance_measure_mat_2)
+max.col(-performance_measure_mat_2)
+##############################################################
+##LOOCV for logistic regression##
+#############################################################
+control <- trainControl(method = "LOOCV")
+Log_fit <- train(position_group ~ ., data = final_df_s, method = "multinom", trControl = control, tuneGrid = data.frame(decay = 0), trace = FALSE)
+
+cm_log <- confusionMatrix(Log_fit$pred$obs, Log_fit$pred$pred)$table
+performance_measure_mat_3 <- as.matrix(sokolova_measures(cm_log), ncol = 1)
+
+
+comparison_mat_loocv <- cbind(performance_measure_mat[,3], performance_measure_mat_2[,c(1,3,5)], performance_measure_mat_3)
+column_names_1 <- c("kNN w/ k=5", "LDA w/ inf. prior", "QDA w/ inf. prior","GMM w/ inf. prior", "Logistic Reg")
+colnames(comparison_mat_loocv) <- column_names_1
+
+max.col(comparison_mat_loocv)
+max.col(-comparison_mat_loocv)
+#########################################################################
+######################Weighted K-class LDA
+##########################################################################
+lda_w_fit <- function(X, gi, K, w , prior = rep(1 / K, K)) {
+  # X: n x p data matrix, gi: class index vector with vals 1:K, w: non-negative weights (must sum up to n)
+  X <- as.matrix(X)
+  p <- ncol(X)
+  M <- matrix(0, p, K)                       # matrix of covariate means per class
+  S <- matrix(0, p, p)                       # pooled within-class scatter
+  class_weight <- numeric(K)
+
+  for (k in 1:K){
+    idx <- gi == k
+    class_weight[k] <- sum(w[idx])
+    M[, k] <- colSums(X[idx, , drop = FALSE] * w[idx]) / class_weight[k]
+    Xc <- sweep(X[idx, , drop = FALSE], 2, M[, k]) #matrix with rows(x_i-m_k)
+    S <- S + crossprod(Xc * sqrt(w[idx]))
+  }
+  S <- S / max(sum(w) - K, 1)
+
+  Sinv <- tryCatch(solve(S), error = function(e) MASS::ginv(S))
+  V  <- Sinv %*% M                           # p x K
+  b0 <- -0.5 * colSums(M * V) + log(prior)
+
+  return(list(V = V, b0 = b0))
+}
+
+########Scores and single-classifier predictions
+lda_w_scores  <- function(fit, X) sweep(as.matrix(X) %*% fit$V, 2, fit$b0, "+")
+lda_w_predict <- function(fit, X) max.col(lda_w_scores(fit, X), ties.method = "first")
+
+#####################################################
+#############Boosting
+#####################################################
+
+boost_lda_w <- function(X, y, E = 250, prior = NULL, max_restarts = 25, verbose = FALSE) {
+  X <- as.matrix(X)
+  n <- nrow(X)
+  g <- factor(y)
+  classes <- levels(g)
+  K <- length(classes)
+  gi <- as.integer(g)
+
+  if (K < 2){stop("Insufficient amount of classes in training data: ", K)}
+  if (is.null(prior)) prior <- rep(1 / K, K)
+
+  err_max <- 0.5
+
+  w <- rep(1, n) #weights sum to n
+  fit_vec <- vector("list", E)
+  vw_vec  <- numeric(E)
+  b <- 0
+  rest <- 0
+
+  while (b < E){
+    fit <- lda_w_fit(X, gi, K, w, prior)
+    psi_i  <- as.numeric(lda_w_predict(fit, X) != gi)   # 1 = misclassified
+    err <- sum(w * psi_i) / n      
+      
+    if (verbose){message(sprintf("b = %3d  err = %.4f", b + 1, err))}
+
+    if (err == 0 && b == 0){
+      b <- 1
+      fit_vec[[1]] <- fit
+      vw_vec[1] <- 1
+      warning("Training error is 0 at the first round; using a single classifier.")
+      break
+    }
+
+    if (err > 0 && err < err_max){
+      b <- b + 1
+      cb <- 0.5 * log((1 - err) / err)
+      fit_vec[[b]] <- fit
+      vw_vec[b] <- cb
+      w <- w * exp(cb * psi_i)
+      w <- w * n / sum(w) # make sure sum = n
+      next
+    }
+    rest <- rest + 1
+    if (rest > max_restarts){
+      warning("Too many restarts (err = 0 or too large); stopping with ", b, " classifiers.")
+      break
+    }
+    repeat{
+      w <- as.numeric(rmultinom(1, n, rep(1 / n, n)))
+      if (all(tapply(w, gi, sum) > 0)) break
+    }
+  }
+
+  output<- list(fits = fit_vec[seq_len(b)], c = vw_vec[seq_len(b)],
+                 classes = classes)
+  class(output) <- "boost_lda_w"
+  return(output)
+}
+###############################
+#####Decision (weighted voting)
+###############################
+predict.boost_lda_w <- function(object, newdata, ...) {
+  X <- as.matrix(newdata)
+  K <- length(object$classes)
+  votes <- matrix(0, nrow(X), K)
+  for (b in seq_along(object$fits)) {
+    pred_b  <- lda_w_predict(object$fits[[b]], X)
+    idx <- cbind(seq_len(nrow(X)), pred_b)
+    votes[idx] <- votes[idx] + object$c[b]
+  }
+  
+  final_pred <- factor(object$classes[max.col(votes, ties.method = "first")],
+         levels = object$classes)
+
+  return(final_pred)
+}
+################################################
+################################################
+#####KNN-Boosting
+################################################
+####Selection of k per cluster function####
+#####################################
+select_k <- function(Xc, yc, orig_idx, k_grid = c(1, 5, length(unique(y)), 15, 25), m_folds){
+  if (length(unique(yc)) == 1)                        # case where cluster has one class
+    return(list(flag_const_class = as.character(yc[1]), k = NA))
+
+  idxs   <- unique(orig_idx)  
+  n_eff <- length(idxs)                                # number of distinct observations
+  cand_k_vec  <- sort(unique(k_grid[k_grid >= 1 & k_grid <= n_eff]))
+  if (length(cand_k_vec) == 0) {cand <- n_eff}
+  if (length(cand_k_vec) == 1 || n_eff < 4){                 
+    return(list(flag_const_class = NULL, k = cand_k_vec[1]))
+  } #limiting cases
+    
+  m_folds <- min(m_folds, n_eff)  #number of folds for internal CV
+  fold_of_idx <- sample(rep(seq_len(m_folds), length.out = n_eff))
+  fold <- fold_of_idx[match(orig_idx, idxs)]       # duplicates share a fold
+
+  err <- setNames(numeric(length(cand_k_vec)), cand_k_vec)
+  for (f in 1:m_folds) {
+    train <- fold != f
+    test <- fold == f
+    if (!any(train) || !any(test)){next} #limiting case where train or test data is empty
+    for (i in seq_along(cand_k_vec)){
+      kk <- min(cand_k_vec[i], sum(train))                     
+      p  <- class::knn(Xc[train, , drop = FALSE], Xc[test, , drop = FALSE], yc[train], k = kk)
+      err[i] <- err[i] + sum(p != yc[test]) #cumulative error over all folds
+    }
+  }
+  out <- list(flag_const_class = NULL, k = cand_k_vec[which.min(err)])
+  return(out)
+}
+################################
+##Kmeans prediction function####
+################################
+kmeans_pred <- function(X_un, centers){
+  dist_mat <- matrix(0, nrow = nrow(X_un), ncol = nrow(centers))
+  for (i in 1:nrow(centers)){
+      dist_mat[,i] <- rowSums(sweep(X_un, 2, centers[i, ])^2)
+  }  
+  pred_center <- max.col(-dist_mat, ties.method = "first")
+  return(pred_center)
+}
+################################
+##Classifier prediction function
+################################
+predict_round <- function(m, Xs, classes) {
+  pred_cluster <- kmeans_pred(Xs, m$km$centers)
+  out <- character(nrow(Xs))
+  for (j in 1:length(m$sel_k)){
+    rows <- which(pred_cluster == j)
+    if (!length(rows)){next}
+    k_j <- m$sel_k[[j]]
+
+    if (!is.null(k_j$flag_const_class)){out[rows] <- k_j$flag_const_class
+      next
+    }
+    else{
+      r_idx <- which(m$km$cluster == j)
+      out[rows] <- as.character(class::knn(m$X[r_idx, , drop = FALSE], Xs[rows, , drop = FALSE], m$y[r_idx], k = min(k_j$k, length(r_idx))))
+    }
+  }
+  output <- factor(out, levels = classes)
+  return(output)
+}
+
+############################
+######Boosting function#####
+############################
+boost_knn <- function(X, y, N = nrow(X), E = 50, k_grid = c(1, 5, length(unique(y)), 15, 25), m  = 10, max_restarts = 25, nstart = 5){
+  #X:Nxp data matrix(standardized), y: class vector(numeric), N = number of drawn observations in resampling,
+  #E: number of epochs ran, k_grid: vector of possible vals for kNN, m: parameter for internal CV
+  #max_restarts:  max number of restarts in the algorithm, nstart = times kmeans is run
+
+  X <- as.matrix(X)
+  g <- factor(y)
+  classes <- levels(g)
+  K <- length(classes)
+  rounds <- list()
+  alpha <- numeric(0)
+
+  
+  for (e in 1:E){
+    flag <- FALSE
+    for (try in 1:max_restarts){
+      if (e == 1){w <- rep(1/N, N)}
+
+      idx_rs <- sample.int(N, replace = TRUE, prob = w)
+      y_rs <- y[idx_rs]
+      X_rs <- X[idx_rs, , drop  = FALSE]
+      n <- length(unique(y_rs))
+
+      if (n < 2){next}
+
+      km_obj <- kmeans(X_rs, centers = n, nstart = nstart)
+
+      opt_k <- vector("list", n)
+
+      for (j in 1:n){
+        r_idx <- which(km_obj$cluster == j)
+        opt_k[[j]]<- select_k(X_rs[r_idx, , drop = FALSE], y_rs[r_idx], idx_rs[r_idx], k_grid, m_folds = m)
+      }
+
+      ks <- list(km = km_obj, X = X_rs, y = y_rs, sel_k = opt_k)
+
+      miss <- as.character(predict_round(ks, X, classes)) != as.character(y)
+      err <- sum(w * miss)                       # error M_e
+      if (err >= 0.5){next}
+
+      w[!miss] <- w[!miss] * err / (1 - err)    
+      w <- w / sum(w)
+
+      rounds[[length(rounds) + 1]] <- ks
+      alpha <- c(alpha, log((1 - err) / err))    # voting weight
+      flag <- TRUE
+      break
+    }
+  if (!flag){
+    warning("Stopped early at round ", e)
+    break
+    }
+  }
+  mod <- list(rounds = rounds, alpha = alpha, classes = classes)
+  return(mod)
+}
+######################################
+######Prediction function######
+######################################
+predict_knnboost <- function(model, Xnew) {
+  Xs <- Xnew
+  votes <- matrix(0, nrow(Xnew), length(model$classes))
+  for (e in 1:length(model$rounds)){
+    p <- match(as.character(predict_round(model$rounds[[e]], Xs, model$classes)),
+               model$classes)
+    ij <- cbind(seq_len(nrow(Xnew)), p)
+    votes[ij] <- votes[ij] + model$alpha[e]      
+  }
+  pred <- factor(model$classes[max.col(votes, ties.method = "first")], levels = model$classes)
+  return(pred)
+}
+##########################################################
+##Cross-validation comparison
+#########################################################
+comparison_mat_20CV <- matrix(0, nrow = 8, ncol = 7)
+rownames(comparison_mat_20CV) <- c("Avg Accuracy", "Error rate",
+     "Micro-avg precision", "Micro-avg recall", "Micro-avg F1-score", "Macro-avg precision", "Macro-avg recall", "Macro-avg F1-score")
+colnames(comparison_mat_20CV) <- c("GMM-inf.", "Logistic reg.", "LDA-inf.", "QDA-inf.", "KNN(k = 5)", "Boost. KNN", "Boost. LDA")
+set.seed(2026)
+GMM_outcome_in_20CV <- cvMclustDA(GMM_obj, nfold = 20, prop = in_prior) ###GMM 20-fold CV
+cm_GMM_20cv <- table(truth = yn, pred = GMM_outcome_in$classification)
+comparison_mat_20CV[ ,1] <- as.matrix(sokolova_measures(cm_GMM_20cv), ncol = 1)
+
+train_idx <- createFolds(y, k = 20, returnTrain = TRUE)
+
+control_1 <- trainControl(method = "cv", index = train_idx, savePredictions = "final")
+Log_fit_20CV <- train(position_group ~ ., data = final_df, method = "multinom", trControl = control_1, tuneGrid = data.frame(decay = 0), trace = FALSE) ##Logistic regr. 20-fold CV
+Lda_fit_20CV <- train(position_group ~ ., data = final_df, method = "lda", trControl = control_1, tuneGrid = data.frame(parameter = 0)) #LDA 20-fold CV
+Qda_fit_20CV <- train(position_group ~ ., data = final_df, method = "qda", trControl = control_1, tuneGrid = data.frame(parameter = 0)) ##QDA 20-fold CV
+kNN_fit_20CV <- train(position_group ~ ., data = final_df, method = "knn", trControl = control_1, tuneGrid = data.frame(k = 5),  preProcess = c("center", "scale")) ##QDA 20-fold CV
+
+cm_log_20cv <- confusionMatrix(Log_fit_20CV$pred$obs, Log_fit_20CV$pred$pred)$table
+cm_lda_20cv <- confusionMatrix(Lda_fit_20CV$pred$obs, Lda_fit_20CV$pred$pred)$table
+cm_qda_20cv <- confusionMatrix(Qda_fit_20CV$pred$obs, Qda_fit_20CV$pred$pred)$table
+cm_knn_20cv <- confusionMatrix(kNN_fit_20CV$pred$obs, kNN_fit_20CV$pred$pred)$table
+comparison_mat_20CV[,2] <- as.matrix(sokolova_measures(cm_log_20cv), ncol = 1)
+comparison_mat_20CV[,3] <- as.matrix(sokolova_measures(cm_lda_20cv), ncol = 1)
+comparison_mat_20CV[,4] <- as.matrix(sokolova_measures(cm_qda_20cv), ncol = 1)
+comparison_mat_20CV[,5] <- as.matrix(sokolova_measures(cm_knn_20cv), ncol = 1)
+
+
+results_boost_knn_20cv <- vector("list", 20)
+results_boost_lda_20cv <- vector("list", 20)
+levels_y
+
+for (i in 1:20){
+  train_idx_i <- train_idx[[i]] 
+  mu  <- colMeans(X[train_idx_i, ])
+  sdv <- apply(X[train_idx_i, ], 2, sd)
+  sdv[sdv == 0] <- 1
+  Xtr <- scale(X[train_idx_i, ], center = mu, scale = sdv)
+  Xte <- scale(X[-train_idx_i, ], center = mu, scale = sdv)
+
+  model_boost_knn <- boost_knn(Xtr, y[train_idx_i], E = 10)
+  pred_boost_knn <- predict_knnboost(model_boost_knn, Xte)
+  cm_boost_knn <- table(True = factor(y[-train_idx_i], levels = levels_y), Pred = factor(pred_boost_knn,  levels = levels_y))
+  model_boost_lda <- boost_lda_w(Xtr, y[train_idx_i], E = 100)
+  pred_boost_lda <- predict(model_boost_lda, Xte)
+  cm_boost_lda <- table(True = factor(y[-train_idx_i], levels = levels_y), Pred = factor(pred_boost_lda,  levels = levels_y))
+
+  results_boost_knn_20cv[[i]] <- sokolova_measures(cm_boost_knn)
+  results_boost_lda_20cv[[i]] <- sokolova_measures(cm_boost_lda) 
+}
+
+M_boost_knn_20cv <- do.call(rbind, results_boost_knn_20cv)
+M_boost_lda_20cv <- do.call(rbind, results_boost_lda_20cv)
+
+comparison_mat_20CV[,6] <- colMeans(M_boost_knn_20cv)
+comparison_mat_20CV[,7] <- colMeans(M_boost_lda_20cv)
+
+max.col(comparison_mat_20CV)
+max.col(-comparison_mat_20CV)
